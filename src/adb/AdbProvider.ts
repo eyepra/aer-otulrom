@@ -2,12 +2,13 @@ import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import { access, lstat, mkdir, rm, stat, writeFile } from "node:fs/promises";
-import { basename, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 
 import type {
   ExecutionOptions,
   ProviderAvailability,
 } from "../application/AnalysisProvider.js";
+import { providerConfigurationRefusal } from "../domain/providerConfigurationRefusal.js";
 import {
   createAnalysisExecution,
   type AnalysisExecution,
@@ -15,7 +16,6 @@ import {
 import type { AdbRequest } from "../domain/adb/adbDeviceAnalysis.js";
 import {
   AnalysisArtifactChangedError,
-  AnalysisCapabilityUnavailableError,
   AnalysisCancelledError,
   AnalysisInputError,
   AnalysisOutputError,
@@ -47,6 +47,7 @@ import {
   parsePackageListOutput,
   parsePmPathOutput,
 } from "./AdbDeviceOutput.js";
+import { adbHostFileName } from "./AdbHostFileName.js";
 import {
   parseAmStartOutput,
   parseBugreportCopiedPath,
@@ -417,8 +418,8 @@ export class AdbProvider {
   async inspectAvailability(
     signal?: AbortSignal,
   ): Promise<ProviderAvailability> {
-    const selection = this.selection();
     try {
+      const selection = this.selection();
       await inspectAdbClient(selection, signal);
       return {
         status: "available",
@@ -555,21 +556,19 @@ export class AdbProvider {
     const signal = options?.signal;
     if (signal?.aborted === true)
       return err(new AnalysisCancelledError(request.operation));
-    const selection = this.selection();
+    let selection: AdbBinarySelection;
     let identity: AdbClientIdentity;
     try {
+      selection = this.selection();
       identity = await inspectAdbClient(selection, signal);
     } catch (cause) {
       if (cause instanceof AnalysisCancelledError) return err(cause);
       if (cause instanceof AdbConfigurationFailure)
         return err(
-          new AnalysisCapabilityUnavailableError(
+          providerConfigurationRefusal(
             ADB_PROVIDER_IDENTITY.id,
             request.operation,
-            typeof cause.diagnostics.remediation === "string"
-              ? `${cause.message} ${cause.diagnostics.remediation}`
-              : cause.message,
-            { cause },
+            cause,
           ),
         );
       return err(
@@ -1401,13 +1400,23 @@ export class AdbProvider {
     },
     signal: AbortSignal | undefined,
   ): Promise<Result<AnalysisExecution, AnalysisError>> {
+    const derived = adbHostFileName(input.device_path);
+    if (!derived.ok)
+      return err(
+        new AnalysisInputError(operation, undefined, [
+          {
+            path: ["device_path"],
+            reason: "invalid_value",
+            message: `The device path does not name a portable host file (${derived.reason}); REA never renames a device-reported file.`,
+          },
+        ]),
+      );
     const directory = await prepareOutputDirectory(
       operation,
       input.output_directory,
     );
     if (!directory.ok) return directory;
-    const fileName = basename(input.device_path) || "pulled";
-    const localPath = join(directory.value, fileName);
+    const localPath = join(directory.value, derived.fileName);
     const existing = await refuseExistingTarget(operation, localPath);
     if (existing !== undefined) return err(existing);
     const pulled = await runAdb(

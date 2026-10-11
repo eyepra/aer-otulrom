@@ -7,6 +7,7 @@ import {
   compareUnicodeCodePoints,
   compositeKey,
 } from "./unicodeCodePointOrder.js";
+import { localPathStringSchema } from "./localPath.js";
 
 import {
   analysisProfileSchema,
@@ -26,6 +27,7 @@ import {
 } from "./evidenceBundle.js";
 import {
   evidenceLocationSchema,
+  rebindEvidenceToTargetPath,
   type Evidence,
   type EvidenceLocation,
   type EvidenceSubjectTarget,
@@ -39,6 +41,7 @@ import { digestSchema } from "./../domain/digests.js";
 import { prefixedDigestSchema } from "./../domain/digests.js";
 import { canonicalJsonDigestSteps } from "./canonicalJsonDigestSteps.js";
 import { freezeJsonSnapshot } from "./immutableJson.js";
+import { rawBinaryEntryPointSchema } from "./rawBinary.js";
 
 const architectureSchema = z.enum(BINARY_ARCHITECTURES);
 const formatSchema = z.enum([
@@ -48,6 +51,7 @@ const formatSchema = z.enum([
   "pe",
   "dos-mz",
   "dos-com",
+  "raw-binary",
   "zip",
   "ipa",
   "apk",
@@ -65,7 +69,7 @@ const formatSchema = z.enum([
 ]);
 const kindSchema = z.enum(["executable", "database", "archive", "artifact"]);
 const subjectSchema = z.object({
-  path: z.string().min(1),
+  path: localPathStringSchema,
   sha256: digestSchema,
   format: z.enum([
     ...formatSchema.options,
@@ -79,12 +83,22 @@ const subjectSchema = z.object({
   ]),
   architecture: architectureSchema.nullable(),
 });
-const targetSchema = z.object({
+const targetIdentitySchema = z.object({
   sha256: digestSchema,
   kind: kindSchema,
-  format: formatSchema,
   architecture: architectureSchema.nullable(),
 });
+const targetSchema = z.discriminatedUnion("format", [
+  targetIdentitySchema.extend({
+    format: z.enum(
+      formatSchema.options.filter((format) => format !== "raw-binary"),
+    ),
+  }),
+  targetIdentitySchema.extend({
+    format: z.literal("raw-binary"),
+    entry_point: rawBinaryEntryPointSchema,
+  }),
+]);
 const bindingSchema = z
   .object({
     provider: committedProviderSchema,
@@ -310,12 +324,16 @@ const canonicalJson = (value: unknown): string => {
 /** Project a binary into the path-free identity used for cache invalidation. */
 export const snapshotTarget = (
   target: BinaryTarget,
-): AnalysisSnapshotTarget => ({
-  sha256: target.sha256,
-  kind: target.kind,
-  format: target.format,
-  architecture: target.architecture ?? null,
-});
+): AnalysisSnapshotTarget => {
+  const identity = {
+    sha256: target.sha256,
+    kind: target.kind,
+    architecture: target.architecture ?? null,
+  };
+  return target.format === "raw-binary"
+    ? { ...identity, format: target.format, entry_point: target.entryPoint }
+    : { ...identity, format: target.format };
+};
 
 /** Build the immutable provider/profile binding used by a cached snapshot. */
 export const snapshotBinding = (
@@ -334,7 +352,10 @@ export const snapshotMatchesTarget = (
   snapshot.sha256 === target.sha256 &&
   snapshot.kind === target.kind &&
   snapshot.format === target.format &&
-  snapshot.architecture === (target.architecture ?? null);
+  snapshot.architecture === (target.architecture ?? null) &&
+  (snapshot.format !== "raw-binary" ||
+    (target.format === "raw-binary" &&
+      snapshot.entry_point === target.entryPoint));
 
 /** Compare a snapshot binding with the selected concrete analysis profile. */
 export const snapshotMatchesProfile = (
@@ -391,7 +412,7 @@ export const snapshotEvidenceForQuery = (
     (candidate) => candidate.query_id === queryId,
   );
   if (entry === undefined && workflowEntry === undefined) return undefined;
-  return snapshot.evidence_bundle.records.find(
+  const evidence = snapshot.evidence_bundle.records.find(
     (record) =>
       record.subject?.digest.sha256 === target.sha256 &&
       record.operation === operation &&
@@ -405,6 +426,9 @@ export const snapshotEvidenceForQuery = (
         (workflowEntry !== undefined &&
           evidenceMatchesWorkflowEntry(record, workflowEntry, snapshot))),
   );
+  return evidence === undefined
+    ? undefined
+    : rebindEvidenceToTargetPath(evidence, target);
 };
 
 /** Create one exact replay record for a derived application workflow result. */

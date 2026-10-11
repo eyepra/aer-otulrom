@@ -336,9 +336,35 @@ it("reports a missing selected binary as a capability gap with recovery", async 
   if (result.ok) return;
   const projected = projectAnalysisError(result.error);
   expect(projected).toMatchObject({ code: "capability_unavailable" });
+  expect(projected.message).toContain("REA_ADB_PATH");
+  expect(projected.remediation).toMatchObject({
+    action: expect.stringContaining("REA_ADB_PATH") as unknown,
+  });
   expect(projected.details).toMatchObject({
     provider_id: "adb",
     reason: expect.stringContaining("not found") as unknown,
+  });
+});
+
+it("reports relative adb configuration as an actionable refusal", async () => {
+  const provider = new AdbProvider({
+    environment: { REA_ADB_PATH: "relative/adb" },
+  });
+  const availability = await provider.inspectAvailability();
+  expect(availability).toMatchObject({
+    status: "unavailable",
+    reason: expect.stringContaining("REA_ADB_PATH") as unknown,
+  });
+  const projected = await refusedBy(provider, {
+    operation: "list_adb_devices",
+    input: {},
+  });
+  expect(projected).toMatchObject({
+    code: "capability_unavailable",
+    message: expect.stringContaining("REA_ADB_PATH") as unknown,
+    remediation: {
+      action: expect.stringContaining("REA_ADB_PATH") as unknown,
+    },
   });
 });
 
@@ -451,6 +477,48 @@ exit 1`,
     sha256: digest,
   });
 });
+
+it.each([
+  ["/data/local/tmp/..", "dot_segment"],
+  ["/data/local/tmp/a\\b", "path_separator"],
+  ["/data/local/tmp/CON", "reserved_name"],
+  ["/data/local/tmp/report.", "trailing_dot_or_space"],
+  ["/data/local/tmp/report:2024", "alternate_data_stream"],
+] as const)(
+  "refuses the unsafe device path %s before pulling",
+  async (devicePath, reason) => {
+    const { binary, root } = await writeAdbStub(
+      (root) => `if [ "$1" = "version" ]; then ${VERSION_BLOCK}; exit 0; fi
+: > "${join(root, "pull-ran")}"
+exit 0`,
+    );
+    const output = join(root, "pulls");
+    const result = await providerOver(binary).execute({
+      operation: "pull_adb_file",
+      input: {
+        serial: "emulator-5554",
+        device_path: devicePath,
+        output_directory: output,
+      },
+    });
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    const projected = projectAnalysisError(result.error);
+    expect(projected).toMatchObject({ code: "invalid_request" });
+    expect(projected.details).toMatchObject({
+      issues: [
+        {
+          path: ["device_path"],
+          reason: "invalid_value",
+          message: expect.stringContaining(reason),
+        },
+      ],
+    });
+    // No host directory and no adb invocation are effects of a refused pull.
+    await expect(readFile(join(root, "pull-ran"))).rejects.toThrow();
+    await expect(readFile(output)).rejects.toThrow();
+  },
+);
 
 it("pushes a file and verifies the device-side digest", async () => {
   const { binary, root } = await writeAdbStub(
