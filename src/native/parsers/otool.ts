@@ -52,6 +52,17 @@ const DYLIB_COMMANDS = new Set([
   "LC_LOAD_UPWARD_DYLIB",
 ]);
 
+const DYLIB_FIELDS = [
+  "cmd",
+  "cmdsize",
+  "name",
+  "current version",
+  "compatibility version",
+];
+// otool prints options for dylib_use_command and a timestamp for dylib_command.
+const DYLIB_ENCODING_FIELDS = ["time stamp", "options"];
+const EMPTY_VALUE_FIELDS = new Set(["options", "segname", "sectname"]);
+
 /**
  * otool emits LF, but a capture replayed from another host or toolchain can
  * carry CRLF. The section/command boundaries below match a bare `\n`, so a
@@ -191,11 +202,12 @@ const parseLoadCommand = (block: string, state: ParsedLoadCommands): void => {
   if (!Number.isSafeInteger(index))
     throw new TypeError("otool load-command index is unsafe");
   const header = block.split(/\n\s*Section\n/u)[0] ?? block;
-  const fields = parseFields(header);
+  const parsed = parseFields(header);
+  const fields = parsed.values;
   const kind = stringField(fields, "cmd");
   if (kind === null) throw new TypeError("otool load command is missing cmd");
-  for (const key of scalarFields(kind)) requireUniqueField(header, key);
-  if (DYLIB_COMMANDS.has(kind)) validateDylibCommandLines(header);
+  for (const key of scalarFields(kind)) requireUniqueField(parsed, key);
+  if (DYLIB_COMMANDS.has(kind)) validateDylibCommandLines(parsed);
   state.commands.push({
     index,
     kind,
@@ -208,19 +220,18 @@ const parseLoadCommand = (block: string, state: ParsedLoadCommands): void => {
   collectSegment(kind, block, fields, state);
 };
 
-const validateDylibCommandLines = (block: string): void => {
-  const allowed = new Set([
-    "cmd",
-    "cmdsize",
-    "name",
-    "time stamp",
-    "current version",
-    "compatibility version",
-  ]);
-  for (const rawLine of block.split("\n").slice(1)) {
-    const line = rawLine.trim();
-    if (line.length === 0) continue;
-    const key = /^(time stamp|\S+(?:\s+version)?)\s+/u.exec(line)?.[1];
+const validateDylibCommandLines = (parsed: ParsedFields): void => {
+  const encodingFields = DYLIB_ENCODING_FIELDS.filter((key) =>
+    Object.hasOwn(parsed.values, key),
+  );
+  if (encodingFields.length !== 1)
+    throw new TypeError(
+      "otool dylib command must contain timestamp or options",
+    );
+  for (const key of encodingFields) requireUniqueField(parsed, key);
+  const allowed = new Set([...DYLIB_FIELDS, ...DYLIB_ENCODING_FIELDS]);
+  for (const field of parsed.rows) {
+    const key = field?.[0];
     if (key === undefined || !allowed.has(key))
       throw new TypeError(
         "otool dylib command contains ambiguous multiline text",
@@ -230,14 +241,7 @@ const validateDylibCommandLines = (block: string): void => {
 
 const scalarFields = (kind: string): readonly string[] => {
   const common = ["cmd", "cmdsize"];
-  if (DYLIB_COMMANDS.has(kind))
-    return [
-      ...common,
-      "name",
-      "time stamp",
-      "current version",
-      "compatibility version",
-    ];
+  if (DYLIB_COMMANDS.has(kind)) return DYLIB_FIELDS;
   if (kind === "LC_LOAD_DYLINKER" || kind === "LC_ID_DYLINKER")
     return [...common, "name"];
   if (kind === "LC_UUID") return [...common, "uuid"];
@@ -336,39 +340,52 @@ const collectSegment = (
   state.segments.push(segment);
 };
 
-const parseFields = (block: string): Record<string, string | number | null> => {
+interface ParsedFields {
+  readonly values: Record<string, string | number | null>;
+  readonly rows: readonly (readonly [string, string] | undefined)[];
+}
+
+const parseFields = (block: string): ParsedFields => {
   const fields: Record<string, string | number | null> = {};
+  const rows: Array<readonly [string, string] | undefined> = [];
   for (const rawLine of block.split(/\r?\n/u).slice(1)) {
-    const line = rawLine.trim();
-    // Keys are `token` or a compound `token version`. `time stamp` is the one
-    // other real key, and it must be matched as a whole: treating `stamp` as a
-    // generic suffix would swallow an install name such as
-    // `name stamp plugin.dylib`, hiding the dependency path behind `unknown`.
-    const match = /^((?:time stamp)|\S+(?:\s+version)?)\s+(.+)$/u.exec(line);
-    if (match?.[1] === undefined || match[2] === undefined) continue;
-    const value = match[2].trim();
-    fields[match[1]] =
-      match[1] === "segname" || match[1] === "sectname"
+    if (rawLine.trim().length === 0) continue;
+    const field = parseField(rawLine);
+    rows.push(field);
+    if (field === undefined) continue;
+    const [key, value] = field;
+    fields[key] =
+      key === "segname" || key === "sectname"
         ? value
         : (numeric(value) ?? value);
   }
-  return fields;
+  return { values: fields, rows };
 };
 
-const requireUniqueField = (block: string, key: string): void => {
-  const escaped = key.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
-  const pattern = new RegExp(`^\\s*${escaped}\\s+`, "mu");
-  let count = 0;
-  for (const line of block.split("\n")) if (pattern.test(line)) count += 1;
-  if (count !== 1)
+const parseField = (rawLine: string): readonly [string, string] | undefined => {
+  const line = rawLine.trim();
+  // Match time stamp as a whole without swallowing `name stamp plugin.dylib`.
+  const match = /^((?:time stamp)|\S+(?:\s+version)?)(?:\s+(.+))?$/u.exec(line);
+  return match?.[1] === undefined
+    ? undefined
+    : [match[1], match[2]?.trim() ?? ""];
+};
+
+const requireUniqueField = (parsed: ParsedFields, key: string): void => {
+  const matches = parsed.rows.filter((field) => field?.[0] === key);
+  const field = matches[0];
+  if (matches.length !== 1 || field === undefined)
     throw new TypeError(`otool field ${key} is missing or repeated`);
+  // Only options and fixed-width Mach-O names may legitimately be empty.
+  if (field[1] === "" && !EMPTY_VALUE_FIELDS.has(key))
+    throw new TypeError(`otool field ${key} has no value`);
 };
 
 const parseSegment = (
   block: string,
   fields: Readonly<Record<string, string | number | null>>,
 ): ParsedSegment => ({
-  name: stringField(fields, "segname") ?? "unknown",
+  name: nonEmptyName(stringField(fields, "segname")),
   vm_address: hexField(fields, "vmaddr"),
   vm_size: numberField(fields, "vmsize"),
   file_offset: numberField(fields, "fileoff"),
@@ -383,7 +400,8 @@ const parseSections = (block: string): ParsedSection[] =>
     .split(/(?=\n\s*Section\n)/u)
     .slice(1)
     .map((sectionBlock) => {
-      const fields = parseFields(`Section${sectionBlock}`);
+      const parsed = parseFields(`Section${sectionBlock}`);
+      const fields = parsed.values;
       for (const key of [
         "sectname",
         "segname",
@@ -393,10 +411,10 @@ const parseSections = (block: string): ParsedSection[] =>
         "align",
         "flags",
       ])
-        requireUniqueField(sectionBlock, key);
+        requireUniqueField(parsed, key);
       return {
-        segment: stringField(fields, "segname") ?? "unknown",
-        name: stringField(fields, "sectname") ?? "unknown",
+        segment: nonEmptyName(stringField(fields, "segname")),
+        name: nonEmptyName(stringField(fields, "sectname")),
         address: hexField(fields, "addr"),
         size: numberField(fields, "size"),
         file_offset: numberField(fields, "offset"),
@@ -450,6 +468,10 @@ const numeric = (value: string): number | null => {
   const parsed = Number.parseInt(value, value.startsWith("0x") ? 16 : 10);
   return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
 };
+
+/** Project an absent or empty Mach-O name as before: the "unknown" label. */
+const nonEmptyName = (name: string | null): string =>
+  name === null || name.length === 0 ? "unknown" : name;
 
 const stringField = (
   fields: Readonly<Record<string, string | number | null>>,
