@@ -26,7 +26,9 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version-file: .nvmrc
-          cache: npm
+      - name: Cache npm package downloads
+        id: npm-cache
+        uses: ./.github/actions/npm-cache
       - run: npm ci
       - uses: ./.github/actions/portable-build-cache
         with:
@@ -43,3 +45,5 @@ jobs:
           echo "REA_VERIFY_SOLC_MODULE=${evm_fixture_root}/node_modules/solc/index.js" >> "${GITHUB_ENV}"
       - name: Verify source-owned compiled bytecode through public CLI and MCP
         run: npm run verify:evm:interface
+      - name: Verify content-hash-free and CBOR-free owned compiler artifacts
+        run: npm run verify:solidity:metadata
