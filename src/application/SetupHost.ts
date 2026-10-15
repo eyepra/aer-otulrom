@@ -45,7 +45,10 @@ import {
   RegularFileCleanupFailure,
   retryRegularFileCleanup,
 } from "./RegularFileRead.js";
-import { providerRegistrationEnvironment } from "./SetupRegistrationEnvironment.js";
+import {
+  explicitSetupRegistrationEnvironment,
+  providerRegistrationEnvironment,
+} from "./SetupRegistrationEnvironment.js";
 import {
   msixPackagesDirectory,
   packagePrivateLauncherBlocker,
@@ -57,6 +60,7 @@ import type {
 } from "./SetupTypes.js";
 import type { DoctorScope } from "./Doctor.js";
 import { CURRENT_ENTRYPOINT_PATH } from "../process/CurrentEntrypointPath.js";
+import { analysisProviderSelectorSchema } from "../contracts/providerSelection.js";
 
 /** Resolve the executable and arguments used in a managed MCP registration. */
 export const setupRegistrationCommand = (
@@ -166,6 +170,17 @@ export const systemSetupHost = (
       scope?: DoctorScope,
     ): Promise<SetupInitialState> => {
       const diagnosis = await runDoctor(undefined, doctorHost, scope);
+      const providerEnvironment: SetupProviderEnvironment = {
+        ...providerRegistrationEnvironment(diagnosis.providerInspections ?? []),
+        ...doctorHost.providerRegistrationEnvironment?.(),
+        ...explicitSetupRegistrationEnvironment(environment),
+        ...(diagnosis.hopperPath === undefined
+          ? {}
+          : { HOPPER_LAUNCHER_PATH: diagnosis.hopperPath }),
+      };
+      const requestedProvider = analysisProviderSelectorSchema.safeParse(
+        environment.REA_ANALYSIS_PROVIDER,
+      );
       return {
         ...(diagnosis.hopperPath === undefined
           ? {}
@@ -175,15 +190,14 @@ export const systemSetupHost = (
         diagnosis.hopperPath === environment.HOPPER_LAUNCHER_PATH
           ? { hopperLauncherConfigured: true }
           : {}),
-        providerEnvironment: {
-          ...providerRegistrationEnvironment(
-            diagnosis.providerInspections ?? [],
-          ),
-          ...doctorHost.providerRegistrationEnvironment?.(),
-          ...(diagnosis.hopperPath === undefined
-            ? {}
-            : { HOPPER_LAUNCHER_PATH: diagnosis.hopperPath }),
-        },
+        providerConfigured:
+          diagnosis.hopperPath !== undefined ||
+          diagnosis.providerInspections?.some(
+            ({ configured }) => configured,
+          ) === true ||
+          providerEnvironment.REA_JEB_MCP_URL !== undefined ||
+          (requestedProvider.success && requestedProvider.data !== "auto"),
+        providerEnvironment,
         doctor: diagnosis,
       };
     },
@@ -230,7 +244,10 @@ export const systemSetupHost = (
     detectedClients: () => detectClients(homeDirectory, platform, environment),
     supportedClients: () =>
       Promise.resolve(supportedClients(homeDirectory, platform, environment)),
-    ...clientConfigurationOperations(resources),
+    ...clientConfigurationOperations(
+      resources,
+      doctorHost.resolveProviderRequestBudget,
+    ),
     skillNeedsInstall: (clientIds) =>
       canonicalSkillNeedsInstall(
         homeDirectory,
@@ -274,7 +291,10 @@ const setupInstallerDiagnostic = (
     : `${normalized.slice(0, 397).trimEnd()}...`;
 };
 
-const clientConfigurationOperations = (resources: ArtifactResourceScope) => ({
+const clientConfigurationOperations = (
+  resources: ArtifactResourceScope,
+  resolveProviderRequestBudget: DoctorHost["resolveProviderRequestBudget"],
+) => ({
   configureClient: (
     client: SetupClient,
     providerEnvironment: SetupProviderEnvironment,
@@ -283,7 +303,12 @@ const clientConfigurationOperations = (resources: ArtifactResourceScope) => ({
     runClientConfigurationOperation(resources, async () =>
       client.format === "unsupported"
         ? { status: "skipped" as const }
-        : configureClientConfiguration(client, providerEnvironment, command),
+        : configureClientConfiguration(
+            client,
+            providerEnvironment,
+            command,
+            resolveProviderRequestBudget,
+          ),
     ),
   clientNeedsConfigure: (
     client: SetupClient,
@@ -297,6 +322,7 @@ const clientConfigurationOperations = (resources: ArtifactResourceScope) => ({
             client,
             providerEnvironment,
             command,
+            resolveProviderRequestBudget,
           )),
     ),
   inspectClientConfiguration: (
@@ -305,7 +331,12 @@ const clientConfigurationOperations = (resources: ArtifactResourceScope) => ({
     command: readonly string[],
   ) =>
     runClientConfigurationOperation(resources, () =>
-      inspectClientConfiguration(client, providerEnvironment, command),
+      inspectClientConfiguration(
+        client,
+        providerEnvironment,
+        command,
+        resolveProviderRequestBudget,
+      ),
     ),
 });
 
