@@ -270,7 +270,9 @@ Mach-O image. Architecture
 `file_offset` values are container-relative. Entrypoint, segment and section
 `file_offset` values retain their source meaning and are relative to the
 selected Mach-O slice. Raw load-command fields retain their original values.
-Evidence locations map the LC_MAIN entrypoint and nonempty file-backed segment
+A field otool prints more than once, such as each `LC_BUILD_VERSION` tool, is
+keyed `name #n` in print order. Each `LC_LINKER_OPTION` string is keyed
+`string #n` and checked against the declared `count`. Evidence locations map the LC_MAIN entrypoint and nonempty file-backed segment
 ranges to container offsets by adding the observed slice offset. Zero-fill
 segments do not produce file ranges. When the selected slice's container offset
 is unknown, those mapped locations are omitted with an explicit limitation;
@@ -378,7 +380,12 @@ complete observation.
   property: `N` means `nonatomic`; a complete typed attribute string without
   `N` means the Objective-C default `atomic`;
   missing or incomplete attribute metadata leaves `atomicity` and any
-  unestablished read-only value null. `is_meta_class`, `is_root_class`, and
+  unestablished read-only value null. A type attribute whose quoted class name
+  never closes is incomplete and marks `objc_properties_categories` partial
+  with `property_attributes_incomplete`. A property record that cannot be
+  decoded, such as one with an empty or unmapped name, is reported as
+  `property_decode_failed` at its entry address while sibling properties are
+  retained. `is_meta_class`, `is_root_class`, and
   `ivar_count` are also nullable when the selected provider exposes only symbol
   names. Class implementation methods have null `is_required` and `is_optional`
   fields because those facts apply to protocol declarations; decoded protocol
