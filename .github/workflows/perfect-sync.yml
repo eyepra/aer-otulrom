@@ -1,4 +1,3 @@
-# prettier-ignore
 name: 纯正 Fork 全量自动化同步 (分支解耦完美版)
 
 on:
@@ -27,7 +26,7 @@ jobs:
     steps:
       # 1. 使用官方标准工具检出当前仓库
       - name: 检出当前仓库
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           fetch-depth: 0 # 获取完整 Git 历史
           # 🔥 使用你刚刚在各个仓库手动配好的全局 Classic 令牌
