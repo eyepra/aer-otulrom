@@ -535,6 +535,222 @@ it("uses an owned APK snapshot and framework cache and resolves regional locales
   expect(result.strings).toEqual([{ name: "greeting", value: "Olá" }]);
 });
 
+it("shares one decode across default and selected locale tables", async () => {
+  const { command, root } = await writeApktoolStub((root) =>
+    decodeStub({ withGerman: false })(root).replace(
+      'if [ "$1" = "d" ]; then',
+      `if [ "$1" = "d" ]; then
+    printf 'd\\n' >> "${root}/decode-invocations.log"
+    mkdir -p "$5/res/values-de" "$5/res/values-pt-rBR"
+    printf '<resources><string name="greeting">Hallo</string></resources>' > "$5/res/values-de/strings.xml"
+    printf '<resources><string name="greeting">Olá</string></resources>' > "$5/res/values-pt-rBR/strings.xml"`,
+    ),
+  );
+  const apk = await apkFixture(root);
+  const observation = await new ApktoolResourceAnalysisService(
+    providerOver(command),
+  ).execute("decode_android_resources", {
+    path: apk.path,
+    include_strings: true,
+    locales: ["de", "pt-BR"],
+  });
+  if (!observation.ok) throw observation.error;
+  const result = apktoolResultSchemas.decode_android_resources.parse(
+    observation.value.normalized_result,
+  );
+  expect(result.string_tables).toEqual([
+    {
+      locale: null,
+      status: "present",
+      strings: [
+        { name: "api_endpoint", value: "https://api.example.com/v1" },
+        { name: "app_name", value: "ApktoolProbe" },
+      ],
+      total_count: 2,
+      unparsed_count: 0,
+      coverage: "complete",
+    },
+    {
+      locale: "de",
+      status: "present",
+      strings: [{ name: "greeting", value: "Hallo" }],
+      total_count: 1,
+      unparsed_count: 0,
+      coverage: "complete",
+    },
+    {
+      locale: "pt-BR",
+      status: "present",
+      strings: [{ name: "greeting", value: "Olá" }],
+      total_count: 1,
+      unparsed_count: 0,
+      coverage: "complete",
+    },
+  ]);
+  expect(result.strings).toEqual([
+    { name: "api_endpoint", value: "https://api.example.com/v1" },
+    { name: "app_name", value: "ApktoolProbe" },
+  ]);
+  expect(result.locale).toBe(null);
+  expect(result.coverage).toBe("complete");
+
+  const invocations = (
+    await readFile(join(root, "decode-invocations.log"), "utf8").catch(() => "")
+  )
+    .trim()
+    .split("\n")
+    .filter((line) => line.length > 0);
+  expect(invocations).toHaveLength(1);
+});
+
+it("reuses normalized directory table for locale aliases without extra reads", async () => {
+  const { command, root } = await writeApktoolStub((root) =>
+    decodeStub()(root).replace(
+      'if [ "$1" = "d" ]; then',
+      `if [ "$1" = "d" ]; then
+    printf 'd\\n' >> "${root}/decode-invocations.log"
+    mkdir -p "$5/res/values-pt-rBR"
+    printf '<resources><string name="greeting">Olá</string></resources>' > "$5/res/values-pt-rBR/strings.xml"`,
+    ),
+  );
+  const apk = await apkFixture(root);
+  const observation = await new ApktoolResourceAnalysisService(
+    providerOver(command),
+  ).execute("decode_android_resources", {
+    path: apk.path,
+    include_strings: true,
+    locale: "pt-BR",
+    locales: ["pt-rBR"],
+  });
+  if (!observation.ok) throw observation.error;
+  const result = apktoolResultSchemas.decode_android_resources.parse(
+    observation.value.normalized_result,
+  );
+  expect(result.string_tables).toEqual([
+    {
+      locale: "pt-BR",
+      status: "present",
+      strings: [{ name: "greeting", value: "Olá" }],
+      total_count: 1,
+      unparsed_count: 0,
+      coverage: "complete",
+    },
+    {
+      locale: "pt-rBR",
+      status: "present",
+      strings: [{ name: "greeting", value: "Olá" }],
+      total_count: 1,
+      unparsed_count: 0,
+      coverage: "complete",
+    },
+  ]);
+  const invocations = (
+    await readFile(join(root, "decode-invocations.log"), "utf8").catch(() => "")
+  )
+    .trim()
+    .split("\n")
+    .filter((line) => line.length > 0);
+  expect(invocations).toHaveLength(1);
+});
+
+it("skips all string tables when include_strings is false despite locales requested", async () => {
+  const { command, root } = await writeApktoolStub((root) =>
+    decodeStub({ withGerman: false })(root).replace(
+      'if [ "$1" = "d" ]; then',
+      `if [ "$1" = "d" ]; then
+    mkdir -p "$5/res/values-de"
+    printf '<resources><string name="greeting">Hallo</string></resources>' > "$5/res/values-de/strings.xml"`,
+    ),
+  );
+  const apk = await apkFixture(root);
+  const observation = await new ApktoolResourceAnalysisService(
+    providerOver(command),
+  ).execute("decode_android_resources", {
+    path: apk.path,
+    include_strings: false,
+    locales: ["de"],
+  });
+  if (!observation.ok) throw observation.error;
+  const result = apktoolResultSchemas.decode_android_resources.parse(
+    observation.value.normalized_result,
+  );
+  expect(result.string_tables).toEqual([]);
+  expect(result.strings).toEqual([]);
+});
+
+it("marks table with styled markup present with partial coverage and unparsed count", async () => {
+  const { command, root } = await writeApktoolStub((root) =>
+    decodeStub({ withGerman: false })(root).replace(
+      'if [ "$1" = "d" ]; then',
+      `if [ "$1" = "d" ]; then
+    mkdir -p "$5/res/values-de"
+    printf '<resources><string name="styled">Hallo <b>Welt</b></string></resources>' > "$5/res/values-de/strings.xml"`,
+    ),
+  );
+  const apk = await apkFixture(root);
+  const observation = await new ApktoolResourceAnalysisService(
+    providerOver(command),
+  ).execute("decode_android_resources", {
+    path: apk.path,
+    include_strings: true,
+    locales: ["de"],
+  });
+  if (!observation.ok) throw observation.error;
+  const result = apktoolResultSchemas.decode_android_resources.parse(
+    observation.value.normalized_result,
+  );
+  const deTable = result.string_tables?.find((t) => t.locale === "de");
+  expect(deTable).toEqual({
+    locale: "de",
+    status: "present",
+    strings: [],
+    total_count: 0,
+    unparsed_count: 1,
+    coverage: "partial",
+  });
+});
+
+it("skips remaining tables without reading or parsing once aggregate string budget is exhausted", async () => {
+  const { command, root } = await writeApktoolStub((root) =>
+    decodeStub({
+      withGerman: false,
+      stringsFile: join(root, "big-strings.xml"),
+    })(root).replace(
+      'if [ "$1" = "d" ]; then',
+      `if [ "$1" = "d" ]; then
+    mkdir -p "$5/res/values-de" "$5/res/values-es" "$5/res/values-it" "$5/res/values-fr"
+    cp '${join(root, "big-strings.xml")}' "$5/res/values-de/strings.xml"
+    cp '${join(root, "big-strings.xml")}' "$5/res/values-es/strings.xml"
+    cp '${join(root, "big-strings.xml")}' "$5/res/values-it/strings.xml"
+    printf '<resources><broken' > "$5/res/values-fr/strings.xml"`,
+    ),
+  );
+  const bigStrings = `<resources>${Array.from({ length: 2000 }, (_, i) => `<string name="s_${String(i)}">val</string>`).join("")}</resources>`;
+  await writeFile(join(root, "big-strings.xml"), bigStrings);
+  const apk = await apkFixture(root);
+  const observation = await new ApktoolResourceAnalysisService(
+    providerOver(command),
+  ).execute("decode_android_resources", {
+    path: apk.path,
+    include_strings: true,
+    locales: ["de", "es", "it", "fr"],
+  });
+  if (!observation.ok) throw observation.error;
+  const result = apktoolResultSchemas.decode_android_resources.parse(
+    observation.value.normalized_result,
+  );
+  const frTable = result.string_tables?.find((t) => t.locale === "fr");
+  expect(frTable).toEqual({
+    locale: "fr",
+    status: "skipped",
+    strings: [],
+    total_count: null,
+    unparsed_count: null,
+    coverage: "partial",
+  });
+  expect(result.coverage).toBe("partial");
+});
+
 it("marks an oversized strings document partial without claiming it is missing", async () => {
   const { command, root } = await writeApktoolStub((root) =>
     decodeStub({ stringsFile: join(root, "large-strings.xml") })(root),
@@ -687,10 +903,32 @@ it("retains completed Evidence and live cleanup until a denied workspace removal
   }
 });
 
-it.each([false, true])(
-  "preserves completed Evidence and cancellation during workspace cleanup (denied=%s)",
-  async (deniedInitially) => {
-    const { command, root } = await writeApktoolStub(decodeStub());
+it.each([
+  [false, "2.7.0-dirty", "CVE-2024-21633", undefined],
+  [true, "2.7.0-dirty", "CVE-2024-21633", undefined],
+  [false, "3.0.1", "CVE-2026-39973", undefined],
+  [true, "3.0.1", "CVE-2026-39973", undefined],
+  [
+    false,
+    "3.0.1",
+    "CVE-2026-39973",
+    "<resources><string name=unquoted>bad</string></resources>",
+  ],
+  [
+    true,
+    "3.0.1",
+    "CVE-2026-39973",
+    "<resources><string name=unquoted>bad</string></resources>",
+  ],
+] as const)(
+  "preserves completed Evidence and cancellation during workspace cleanup (denied=%s, version=%s, advisory=%s, XML=%s)",
+  async (deniedInitially, version, advisory, stringsXml) => {
+    const { command, root } = await writeApktoolStub((root) =>
+      decodeStub(stringsXml === undefined ? {} : { stringsXml })(root).replace(
+        VERSION_BLOCK,
+        `printf '%s\\n' '${version}'`,
+      ),
+    );
     const apk = await apkFixture(root);
     const controller = new AbortController();
     const reason = { caller: "during final workspace removal" };
@@ -720,9 +958,15 @@ it.each([false, true])(
         operation: "decode_android_resources",
         normalized_result: { target: { sha256: apk.sha256 } },
         limitations: expect.arrayContaining([
-          expect.stringContaining("CVE-2024-21633"),
+          expect.stringContaining(advisory),
         ]),
       });
+      if (stringsXml !== undefined)
+        expect(result.error.partialObservation).toMatchObject({
+          limitations: expect.arrayContaining([
+            expect.stringContaining("entry counts are unknown"),
+          ]),
+        });
       denied = false;
       await provider.close();
       expect(result.error.cleanupIncomplete).toBe(false);
@@ -1003,7 +1247,18 @@ it("discloses qualified and unfamiliar strings tables while preserving exact loc
   }
 });
 
-it.each(["2.7.0-dirty", "2.9.1", "2.9.2-rc.1", "2.9.2", "2.9.2-dirty"])(
+it.each([
+  "2.7.0-dirty",
+  "2.9.1",
+  "2.9.2-rc.1",
+  "2.9.2",
+  "2.9.2-dirty",
+  "3.0.0",
+  "3.0.1",
+  "3.0.2-rc.1",
+  "3.0.2",
+  "3.1.0",
+])(
   "retains reported-version limitations for both operations without refusing %s (#3438)",
   async (version) => {
     const { command, root } = await writeApktoolStub((root) =>
@@ -1026,9 +1281,31 @@ it.each(["2.7.0-dirty", "2.9.1", "2.9.2-rc.1", "2.9.2", "2.9.2-dirty"])(
         limitation.includes("CVE-2024-21633"),
       );
       expect(warnings.length).toBe(
-        ["2.9.2", "2.9.2-dirty"].includes(version) ? 0 : 1,
+        ["2.7.0-dirty", "2.9.1", "2.9.2-rc.1"].includes(version) ? 1 : 0,
       );
       if (warnings.length > 0) expect(warnings[0]).toContain("CVE-2024-21633");
+      expect(
+        inspect.value.limitations.filter((warning) =>
+          warning.includes("CVE-2026-39973"),
+        ).length,
+      ).toBe(["3.0.0", "3.0.1", "3.0.2-rc.1"].includes(version) ? 1 : 0);
+      expect(
+        inspect.value.limitations.filter((warning) =>
+          warning.includes("GHSA-vgwr-4w3p-xmjv"),
+        ).length,
+      ).toBe(
+        process.platform === "win32" &&
+          [
+            "2.7.0-dirty",
+            "2.9.1",
+            "2.9.2-rc.1",
+            "2.9.2",
+            "2.9.2-dirty",
+          ].includes(version)
+          ? 1
+          : 0,
+      );
+
       for (const warning of inspect.value.limitations)
         expect(decode.value.limitations).toContain(warning);
       expect(inspect.value.result).toMatchObject({
@@ -1039,6 +1316,61 @@ it.each(["2.7.0-dirty", "2.9.1", "2.9.2-rc.1", "2.9.2", "2.9.2-dirty"])(
         target: { sha256: apk.sha256 },
         coverage: "complete",
       });
+    } finally {
+      await provider.close();
+    }
+  },
+);
+
+it.each([
+  [
+    "malformed",
+    '<resources><string name="a">one</string><string name="b">two</resources>',
+    [],
+  ],
+  ["wrong_root", "<manifest/>", []],
+  [
+    "unsupported",
+    '<resources><string name="a"><b>A</b></string><string>unnamed</string><string name="good">ok</string></resources>',
+    [{ name: "good", value: "ok" }],
+  ],
+] as const)(
+  "reports document projection semantics for %s (#4820)",
+  async (kind, stringsXml, strings) => {
+    const { command, root } = await writeApktoolStub(
+      decodeStub({ stringsXml }),
+    );
+    const apk = await apkFixture(root);
+    const provider = providerOver(command);
+    try {
+      const result = await provider.execute({
+        operation: "decode_android_resources",
+        input: { path: apk.path, include_strings: true },
+      });
+      if (!result.ok) throw result.error;
+      expect(result.value.result).toMatchObject({
+        strings,
+        target: { sha256: apk.sha256 },
+        coverage: "partial",
+      });
+      const limitations = result.value.limitations.join("\n");
+      if (kind === "unsupported") {
+        expect(limitations).toContain(
+          "String entries omitted due to unsupported markup or missing names: 2",
+        );
+        expect(limitations).not.toContain("entry counts are unknown");
+      } else {
+        expect(limitations).toContain(
+          'String table "res/values/strings.xml" could not be projected:',
+        );
+        expect(limitations).toContain("entry counts are unknown");
+        expect(limitations).not.toContain("String entries omitted");
+        expect(limitations).toContain(
+          kind === "wrong_root"
+            ? "root must be <resources>"
+            : "XML is not well-formed",
+        );
+      }
     } finally {
       await provider.close();
     }
