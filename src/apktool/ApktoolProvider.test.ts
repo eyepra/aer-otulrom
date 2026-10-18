@@ -14,6 +14,7 @@ import { join } from "node:path";
 import { describe, expect, onTestFinished, test, vi } from "vitest";
 
 import { ApktoolProvider } from "./ApktoolProvider.js";
+import { ApktoolWorkspace } from "./ApktoolWorkspace.js";
 import { ApktoolResourceAnalysisService } from "../application/apktool/ApktoolResourceAnalysisService.js";
 import { projectAnalysisError } from "../domain/analysisErrorProjection.js";
 import {
@@ -167,6 +168,186 @@ const apkFixture = async (
     sha256: createHash("sha256").update(bytes).digest("hex"),
   };
 };
+
+it.each([
+  [false, false],
+  [true, false],
+  [false, true],
+  [true, true],
+])(
+  "retains completed decode facts when a later locale read fails (cleanup denied: %s, late cancellation: %s)",
+  async (denyCleanup, lateCancellation) => {
+    const { command, root } = await writeApktoolStub((path) =>
+      decodeStub()(path).replace(
+        "  printf 'I: Using Apktool on stub",
+        "  printf '\\377' > \"$5/res/values-de/strings.xml\"\n  printf 'I: Using Apktool on stub",
+      ),
+    );
+    const apk = await apkFixture(root);
+    let denied = denyCleanup;
+    const controller = new AbortController();
+    const provider = new ApktoolProvider({
+      environment: { REA_APKTOOL_COMMAND: command },
+      removeWorkspace: async (path) => {
+        if (lateCancellation) controller.abort({ stage: "cleanup" });
+        if (denied) throw new Error("authored removal denial");
+        await rm(path, { recursive: true, force: true });
+      },
+    });
+    try {
+      const result = await provider.execute(
+        {
+          operation: "decode_android_resources",
+          input: { path: apk.path, include_strings: true, locales: ["de"] },
+        },
+        { signal: controller.signal },
+      );
+      if (result.ok) throw new Error("Expected invalid UTF-8 failure");
+      expect((result.error.cleanupPrimary ?? result.error).message).toContain(
+        "UTF-8",
+      );
+      expect(result.error.cleanupIncomplete).toBe(denyCleanup);
+      const observation = {
+        operation: "decode_android_resources",
+        parameters: { path: apk.path, locales: ["de"] },
+        subject: { local_path: apk.path, digest: { sha256: apk.sha256 } },
+        normalized_result: {
+          metadata: { package_name: "com.rea.apktool.probe" },
+          manifest: `${REAL_MANIFEST}\n`,
+          strings: [
+            { name: "api_endpoint", value: "https://api.example.com/v1" },
+            { name: "app_name", value: "ApktoolProbe" },
+          ],
+          string_tables: [{ locale: null, status: "present", total_count: 2 }],
+          coverage: "partial",
+        },
+      };
+      expect(result.error.partialObservation).toMatchObject(observation);
+      expect(projectAnalysisError(result.error)).toMatchObject({
+        details: { partial_observation: observation },
+      });
+      denied = false;
+      await provider.close();
+      expect(result.error.cleanupIncomplete).toBe(false);
+      expect(result.error.partialObservation).toMatchObject(observation);
+    } finally {
+      denied = false;
+      await provider.close();
+    }
+  },
+);
+
+it.each(
+  (["manifest-bytes", "manifest-xml", "inventory"] as const).flatMap((stage) =>
+    [false, true].map((denied) => [stage, denied] as const),
+  ),
+)(
+  "retains parsed metadata when %s fails before string projection (cleanup denied: %s)",
+  async (stage, denyCleanup) => {
+    const { command, root } = await writeApktoolStub(decodeStub());
+    const apk = await apkFixture(root);
+    if (stage === "inventory") {
+      const entries = ApktoolWorkspace.prototype.entries;
+      const spy = vi
+        .spyOn(ApktoolWorkspace.prototype, "entries")
+        .mockImplementationOnce(async function* (
+          this: ApktoolWorkspace,
+          ...args
+        ) {
+          for await (const entry of entries.apply(this, args)) {
+            yield entry;
+            if (entry.kind === "file")
+              throw new Error("authored enumeration failure");
+          }
+        });
+      onTestFinished(() => spy.mockRestore());
+    } else {
+      const manifestFile = join(root, "manifest-control");
+      await writeFile(
+        manifestFile,
+        stage === "manifest-bytes" ? Buffer.from([255]) : "<resources/>",
+      );
+      await writeFile(
+        command,
+        `#!/bin/sh\n${decodeStub({ manifestFile })(root)}`,
+        { mode: 0o755 },
+      );
+    }
+    const controller = new AbortController();
+    let denied = denyCleanup;
+    const provider = new ApktoolProvider({
+      environment: { REA_APKTOOL_COMMAND: command },
+      removeWorkspace: async (path) => {
+        controller.abort({ stage: "final cleanup" });
+        if (denied) throw new Error("authored staged removal denial");
+        await rm(path, { recursive: true, force: true });
+      },
+    });
+    try {
+      const result = await provider.execute(
+        {
+          operation: "decode_android_resources",
+          input: { path: apk.path, include_strings: true },
+        },
+        { signal: controller.signal },
+      );
+      if (result.ok) throw new Error("Expected staged read failure");
+      expect((result.error.cleanupPrimary ?? result.error)._tag).toBe(
+        "AnalysisProtocolError",
+      );
+      expect(controller.signal.aborted).toBe(true);
+      expect(result.error.cleanupIncomplete).toBe(denyCleanup);
+      const observation = result.error.partialObservation;
+      expect(observation).toMatchObject({
+        operation: "decode_android_resources",
+        subject: { local_path: apk.path, digest: { sha256: apk.sha256 } },
+        normalized_result: {
+          coverage: "partial",
+          metadata: {
+            version_name: "1.2.3",
+            version_code: "7",
+            min_sdk_version: "24",
+            target_sdk_version: "34",
+          },
+        },
+      });
+      const projected = projectAnalysisError(result.error).details
+        ?.partial_observation;
+      expect(projected).toEqual(observation);
+      expect(observation).toHaveProperty("normalized_result");
+      if (observation === undefined || !("normalized_result" in observation))
+        throw new Error("Expected partial Evidence");
+      expect(observation.normalized_result).not.toHaveProperty("strings");
+      if (stage !== "inventory") {
+        expect(observation.normalized_result).not.toHaveProperty(
+          "decoded_file_count",
+        );
+        expect(observation.normalized_result).not.toHaveProperty(
+          "metadata.package_name",
+        );
+      }
+      if (stage === "manifest-bytes")
+        expect(observation.normalized_result).not.toHaveProperty("manifest");
+      if (stage === "manifest-xml")
+        expect(observation.normalized_result).toHaveProperty(
+          "manifest",
+          "<resources/>",
+        );
+      if (stage === "inventory")
+        expect(observation.normalized_result).toMatchObject({
+          decoded_file_count: 1,
+          metadata: { package_name: "com.rea.apktool.probe" },
+        });
+      denied = false;
+      await provider.close();
+      expect(result.error.cleanupIncomplete).toBe(false);
+      expect(result.error.partialObservation).toEqual(observation);
+    } finally {
+      denied = false;
+      await provider.close();
+    }
+  },
+);
 
 it("inspects the apktool launcher", async () => {
   const { command } = await writeApktoolStub(
@@ -653,6 +834,63 @@ it("reuses normalized directory table for locale aliases without extra reads", a
   expect(invocations).toHaveLength(1);
 });
 
+it.each([2000, 2001])(
+  "retains observed alias counts after exhausting the aggregate entry budget (%i entries)",
+  async (entryCount) => {
+    const { command, root } = await writeApktoolStub((root) =>
+      decodeStub({ withGerman: false, withStrings: false })(root).replace(
+        'if [ "$1" = "d" ]; then',
+        `if [ "$1" = "d" ]; then
+    for suffix in pt-rBR de es it; do
+      mkdir -p "$5/res/values-$suffix"
+      cp '${join(root, "strings.xml")}' "$5/res/values-$suffix/strings.xml"
+    done`,
+      ),
+    );
+    const entries = Array.from(
+      { length: entryCount },
+      (_, i) => `<string name="s_${String(i)}">value</string>`,
+    ).join("");
+    await writeFile(
+      join(root, "strings.xml"),
+      `<resources>${entries}<string name="styled"><b>unknown</b></string></resources>`,
+    );
+    const apk = await apkFixture(root);
+    const provider = providerOver(command);
+    try {
+      const observation = await new ApktoolResourceAnalysisService(
+        provider,
+      ).execute("decode_android_resources", {
+        path: apk.path,
+        include_strings: true,
+        locale: "pt-BR",
+        locales: ["de", "es", "it", "pt-rBR"],
+      });
+      if (!observation.ok) throw observation.error;
+      const result = apktoolResultSchemas.decode_android_resources.parse(
+        observation.value.normalized_result,
+      );
+      expect(result.string_tables?.at(-1)).toEqual({
+        locale: "pt-rBR",
+        status: "skipped",
+        strings: [],
+        total_count: entryCount,
+        unparsed_count: 1,
+        coverage: "partial",
+      });
+      expect(result.strings).toHaveLength(2000);
+      expect(
+        observation.value.limitations.some((note) =>
+          note.startsWith("Locale pt-rBR strings reports the first"),
+        ),
+      ).toBe(false);
+      expect(result.coverage).toBe("partial");
+    } finally {
+      await provider.close();
+    }
+  },
+);
+
 it("skips all string tables when include_strings is false despite locales requested", async () => {
   const { command, root } = await writeApktoolStub((root) =>
     decodeStub({ withGerman: false })(root).replace(
@@ -1020,11 +1258,23 @@ it.each(["decode", "projection"] as const)(
         expect(result.error.capturedOutput?.stderr).toContain(
           "Could not decode the APK",
         );
-      expect(result.error.partialObservation).toMatchObject({
-        kind: "file-snapshot-hash",
-        path: apk.path,
-        sha256: apk.sha256,
-      });
+      expect(result.error.partialObservation).toMatchObject(
+        stage === "decode"
+          ? {
+              kind: "file-snapshot-hash",
+              path: apk.path,
+              sha256: apk.sha256,
+            }
+          : {
+              operation: "decode_android_resources",
+              subject: { local_path: apk.path, digest: { sha256: apk.sha256 } },
+              normalized_result: {
+                coverage: "partial",
+                metadata: { package_name: "com.rea.apktool.probe" },
+                strings: [],
+              },
+            },
+      );
     } finally {
       await provider.close();
     }

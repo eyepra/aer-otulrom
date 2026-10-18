@@ -138,7 +138,7 @@ export const stringTableSchema = z.strictObject({
     .nonnegative()
     .nullable()
     .describe(
-      "Total valid string entries before per-table cap, or null if unmeasured/skipped/malformed",
+      "Total valid string entries before output limits, or null if the table was not examined or was malformed",
     ),
   unparsed_count: z
     .number()
@@ -146,7 +146,7 @@ export const stringTableSchema = z.strictObject({
     .nonnegative()
     .nullable()
     .describe(
-      "Entries skipped due to nested markup or missing attributes, or null if unmeasured/skipped/malformed",
+      "Entries skipped due to nested markup or missing attributes, or null if the table was not examined or was malformed",
     ),
   coverage: z.enum(["complete", "partial"]),
 });
@@ -191,3 +191,7 @@ export const apktoolResultSchemas = {
     coverage: z.enum(["complete", "partial"]),
   }),
 } as const;
+
+export type ApktoolDecodeResult = z.infer<
+  typeof apktoolResultSchemas.decode_android_resources
+>;
