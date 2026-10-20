@@ -4,7 +4,13 @@ import {
   analysisViewResultSchema,
   type AnalysisViewResult,
 } from "../../domain/analysisView/analysisView.js";
+import { scenarioCaptureRecords } from "../../domain/analysisView/scenarioCaptureRecords.js";
+import {
+  readRecordedResponseBody,
+  type RecordedResponseBody,
+} from "../../domain/analysisView/recordedResponseBody.js";
 import { readRecordedRequestLine } from "../../domain/analysisView/webNetworkRouteTemplates.js";
+import { browserScenarioCaptureSchema } from "../../domain/browserScenarioCapture.js";
 import type { AnalysisError } from "../../domain/analysisErrorBase.js";
 import {
   AnalysisInputError,
@@ -28,34 +34,33 @@ export type EnvironmentManifest = Extract<
 >;
 export type EnvironmentManifestTool = EnvironmentManifest["tools"][number];
 
-/** One retained parent record reduced to what a replay returns. */
-export interface RecordedExchange {
+/** One retained parent record reduced to what a replay returns; a cut body is reported truncated. */
+export interface RecordedExchange extends RecordedResponseBody {
   readonly ordinal: number;
   readonly path: string;
   /** WHATWG query spelling including `?`, or null when the request had none. */
   readonly query: string | null;
   readonly status: number | null;
   readonly contentType: string | null;
-  /** Producer-decoded response text, or null when the record retained none. */
-  readonly bodyText: string | null;
-  /** Set when the retained bytes are not UTF-8, so `bodyText` holds their base64 rather than a lossy decoding. */
-  readonly bodyEncoding?: "base64";
-  /** Set when only a prefix of a large base64 body was decoded; replay reports it truncated. */
-  readonly bodyCut?: true;
 }
 
 /** Replayed bodies larger than this are cut at a UTF-8 boundary and flagged. */
 export const REPLAY_BODY_LIMIT_BYTES = 256 * 1024;
 
-/** Base64 characters that decode to just over the replay limit, so a cut prefix still fills it. */
-const BASE64_PREFIX_CHARS = Math.ceil((REPLAY_BODY_LIMIT_BYTES + 4) / 3) * 4;
+/** A HAR inspected by inspect_web_network_capture, or a session recorded by capture_browser_scenario. */
+export type EnvironmentCaptureKind = "web-network-capture" | "browser-scenario";
 
 /** A manifest and the parent capture it cites, authenticated and cross-checked. */
 export interface EnvironmentSource {
   readonly manifest: EnvironmentManifest;
   readonly manifestEvidenceId: string;
   readonly evidenceId: string;
-  /** SHA-256 of the captured artifact, or null when the capture excluded it from Evidence. */
+  /** Which REA operation recorded the parent capture. */
+  readonly captureKind: EnvironmentCaptureKind;
+  /**
+   * SHA-256 of the captured artifact for a web network capture, or of the scenario definition for a
+   * browser scenario; null when the capture excluded it from Evidence.
+   */
   readonly captureSha256: string | null;
   /** Parent records cited by at least one tool, keyed by producer ordinal. */
   readonly exchanges: ReadonlyMap<number, RecordedExchange>;
@@ -97,52 +102,6 @@ const parseEvidenceFile = (
   }
 };
 
-const contentTextSchema = z.object({
-  response: z.object({
-    content: z.object({
-      text: z.unknown().optional(),
-      encoding: z.unknown().optional(),
-    }),
-  }),
-});
-
-/** Strict, and keeping a leading byte-order mark, so replay returns the recorded text unchanged. */
-const strictUtf8 = (): TextDecoder =>
-  new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
-
-/** The retained response text of one record, decoding HAR base64 content when the decoder kept it as valid UTF-8. */
-const recordedBody = (
-  record: WebNetworkCaptureRecord,
-): Pick<RecordedExchange, "bodyText" | "bodyEncoding"> => {
-  const content = contentTextSchema.safeParse(record.reported);
-  if (!content.success) return { bodyText: null };
-  const { text, encoding } = content.data.response.content;
-  if (typeof text !== "string") return { bodyText: null };
-  if (encoding !== "base64") return { bodyText: text };
-  const binary = record.binary_fields.find(
-    (field) =>
-      field.pointer === "/response/content/text" && field.state === "retained",
-  );
-  if (binary === undefined || binary.content_base64 === null)
-    return { bodyText: null };
-  // Replay returns at most REPLAY_BODY_LIMIT_BYTES, so a large body is decoded only that far.
-  const cut = binary.content_base64.length > BASE64_PREFIX_CHARS;
-  const encoded = cut
-    ? binary.content_base64.slice(0, BASE64_PREFIX_CHARS)
-    : binary.content_base64;
-  const flags = cut ? { bodyCut: true as const } : {};
-  try {
-    // A cut prefix may end inside a character; streaming leaves that tail undecoded.
-    const text = strictUtf8().decode(Buffer.from(encoded, "base64"), {
-      stream: cut,
-    });
-    return { bodyText: text, ...flags };
-  } catch {
-    // Binary or non-UTF-8 bytes: keep them exactly, as base64, instead of inventing replacement characters.
-    return { bodyText: encoded, bodyEncoding: "base64", ...flags };
-  }
-};
-
 const recordedExchange = (
   record: WebNetworkCaptureRecord,
 ): RecordedExchange | undefined => {
@@ -154,7 +113,7 @@ const recordedExchange = (
     query: line.query === undefined || line.query === "" ? null : line.query,
     status: line.status,
     contentType: line.rawMime === "" ? null : line.rawMime,
-    ...recordedBody(record),
+    ...readRecordedResponseBody(record, REPLAY_BODY_LIMIT_BYTES),
   };
 };
 
@@ -194,7 +153,7 @@ const parseManifestEvidence = (
   return ok({ manifest: view.data, evidenceId: evidence.value.evidence_id });
 };
 
-/** Authenticate the evidence file and require complete capture Evidence. */
+/** Authenticate the evidence file and require complete capture Evidence of either kind. */
 const parseCaptureEvidence = (
   operation: string,
   value: unknown,
@@ -202,63 +161,80 @@ const parseCaptureEvidence = (
   {
     readonly records: readonly WebNetworkCaptureRecord[];
     readonly evidenceId: string;
+    readonly captureKind: EnvironmentCaptureKind;
     readonly captureSha256: string | null;
   },
   AnalysisError
 > => {
   const evidence = parseEvidenceFile(operation, "evidence", value);
   if (!evidence.ok) return evidence;
+  const { evidence_id: evidenceId } = evidence.value;
   const normalized = immutableJsonSnapshotMember(
     evidence.value,
     "normalized_result",
   );
-  const records = immutableJsonSnapshotMember(normalized, "records");
-  if (Array.isArray(records))
-    for (let index = 0; index < records.length; index += 1) {
-      const record = immutableJsonSnapshotMember(records, String(index));
-      immutableJsonSnapshotMember(record, "reported");
+  if (evidence.value.operation === "capture_browser_scenario") {
+    const scenario = browserScenarioCaptureSchema.safeParse(normalized);
+    const definition = z
+      .object({ scenario_sha256: z.string() })
+      .safeParse(evidence.value.parameters);
+    if (scenario.success)
+      return ok({
+        records: scenarioCaptureRecords(scenario.data, "replay").records,
+        evidenceId,
+        captureKind: "browser-scenario",
+        captureSha256: definition.success
+          ? definition.data.scenario_sha256
+          : null,
+      });
+  } else if (evidence.value.operation === "inspect_web_network_capture") {
+    const records = immutableJsonSnapshotMember(normalized, "records");
+    if (Array.isArray(records))
+      for (let index = 0; index < records.length; index += 1) {
+        const record = immutableJsonSnapshotMember(records, String(index));
+        immutableJsonSnapshotMember(record, "reported");
+      }
+    const capture = webNetworkCaptureSchema.safeParse(normalized);
+    if (capture.success) {
+      // The manifest view projects HAR captures only, and replay reads HAR's response fields.
+      if (capture.data.format !== "har")
+        return err(
+          inputError(
+            operation,
+            [
+              {
+                path: ["evidence", "normalized_result", "format"],
+                reason: "invalid_value",
+                expected: "har",
+                message: `Agent environments replay HAR captures; this capture's format is ${capture.data.format}.`,
+              },
+            ],
+            "The evidence file is not a HAR capture.",
+          ),
+        );
+      return ok({
+        records: capture.data.records,
+        evidenceId,
+        captureKind: "web-network-capture",
+        captureSha256: capture.data.artifact.sha256,
+      });
     }
-  const capture = webNetworkCaptureSchema.safeParse(normalized);
-  if (
-    evidence.value.operation !== "inspect_web_network_capture" ||
-    !capture.success
-  )
-    return err(
-      inputError(
-        operation,
-        [
-          {
-            path: ["evidence", "operation"],
-            reason: "invalid_value",
-            expected: "inspect_web_network_capture",
-            message:
-              "The evidence file must be complete inspect_web_network_capture Evidence.",
-          },
-        ],
-        "The evidence file is not web network capture Evidence.",
-      ),
-    );
-  // The manifest view projects HAR captures only, and replay reads HAR's response fields.
-  if (capture.data.format !== "har")
-    return err(
-      inputError(
-        operation,
-        [
-          {
-            path: ["evidence", "normalized_result", "format"],
-            reason: "invalid_value",
-            expected: "har",
-            message: `Agent environments replay HAR captures; this capture's format is ${capture.data.format}.`,
-          },
-        ],
-        "The evidence file is not a HAR capture.",
-      ),
-    );
-  return ok({
-    records: capture.data.records,
-    evidenceId: evidence.value.evidence_id,
-    captureSha256: capture.data.artifact.sha256,
-  });
+  }
+  return err(
+    inputError(
+      operation,
+      [
+        {
+          path: ["evidence", "operation"],
+          reason: "invalid_value",
+          expected: "inspect_web_network_capture or capture_browser_scenario",
+          message:
+            "The evidence file must be complete inspect_web_network_capture or capture_browser_scenario Evidence.",
+        },
+      ],
+      "The evidence file is not web network capture or browser scenario Evidence.",
+    ),
+  );
 };
 
 /**
@@ -317,6 +293,7 @@ export const loadEnvironmentSource = (
     manifest: manifest.value.manifest,
     manifestEvidenceId: manifest.value.evidenceId,
     evidenceId: capture.value.evidenceId,
+    captureKind: capture.value.captureKind,
     captureSha256: capture.value.captureSha256,
     exchanges: indexExchanges(manifest.value.manifest, capture.value.records),
   });
