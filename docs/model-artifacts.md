@@ -44,7 +44,10 @@ that defeats filesystem metadata checks.
 GGUF reports version, byte order, alignment, typed metadata, and each tensor's
 name, original type ID, dimensions, relative data offset, file offset and derived
 byte length. Alignment accepts every positive UINT32 multiple of eight, including
-non-powers of two. Metadata keys use ASCII lower-snake-case hierarchy components;
+non-powers of two. Partial Evidence retains explicit alignment once validated;
+the default alignment becomes known after metadata completes. Cancellation
+during tensor parsing or hashing retains that fact without claiming finalized
+digests or file identity. Metadata keys use ASCII lower-snake-case hierarchy components;
 standard numeric components such as `general.base_model.0.name` are preserved.
 Scalar metadata is complete. Arrays have declared element types,
 counts and at most eight preview elements per array, with an explicit
@@ -62,7 +65,13 @@ contradictions are rejected with a typed `file_format_rejected` constraint (publ
 A missing, non-regular or otherwise unusable selected path is also `target_unavailable`;
 host I/O or resource failures on a valid selection, such as `EMFILE` or `EIO`, are
 `execution_failure` with the path and reason in `details.diagnostics`. Empty
-tensors and scalar shapes are supported; packed sub-byte types require whole
+tensors and scalar shapes are supported. The reader retains shape dimensions as
+exact unsigned 64-bit values, including values above JavaScript's safe-integer
+range when a zero extent makes storage empty. Shape products are checked in
+declaration order, as in the
+[64-bit upstream reader](https://github.com/huggingface/safetensors/blob/e246a2560645b7525f5775669ed816eb57c5bcc8/safetensors/src/tensor.rs#L604-L609);
+a later zero does not erase an earlier product overflow. Actual file and data
+offsets must still fit exact host offset precision. Packed sub-byte types require whole
 byte storage. Unknown dtypes retain declared ranges and an explicit limitation
 that shape-to-storage validation is unavailable. Each tensor records
 `storage_validation: "consistent" | "unknown"`; `coverage.storage_sizes` remains
@@ -79,7 +88,9 @@ GGUF supports zero extents and scalar shapes, with at most four dimensions;
 known quantized types still require complete blocks in the first dimension.
 
 MCP defaults to a compact summary with counts, selected short headline metadata,
-chat-template presence and derived totals. The full type histogram and all rows
+chat-template presence (default or named template content) and derived totals.
+A names-only `tokenizer.chat_templates` inventory does not establish template
+content. The full type histogram and all rows
 remain in complete Evidence. Headline metadata uses short keys/types and scalar
 values; long or compound values remain available through explicit metadata
 queries. Use the returned `parent_evidence_id`:
