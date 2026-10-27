@@ -100,7 +100,7 @@ it("formats arrays of empty objects without columns as JSON in Markdown", async 
   const json = await runFilteredCli(value, "json");
   expect(JSON.parse(json)).toEqual(value);
   const markdown = await runFilteredCli(value, "md");
-  expect(markdown).toBe("[{},{}]\n");
+  expect(markdown).toBe("\\[{},{}\\]\n");
 });
 
 it.each(
@@ -322,6 +322,43 @@ const overlappingPaths = [
   "rows[1,4].right,rows[0,3].left",
 ] as const;
 
+it("projects consecutive slices through nested root arrays and merges cell fields", async () => {
+  const value = freezeRecursively([
+    [
+      { left: 1, right: 2 },
+      { left: 3, right: 4 },
+    ],
+    [{ left: 5, right: 6 }],
+  ]);
+  const output = await runFilteredCli(
+    value,
+    "json",
+    "[0,2][0,1].left,[0,1][0,2].right",
+  );
+  expect(JSON.parse(output)).toEqual([
+    [{ left: 1, right: 2 }, { right: 4 }],
+    [{ left: 5 }],
+  ]);
+});
+
+it.each([
+  ["rows[0,2][-2,-1]", { rows: [[1], [3]] }],
+  ["rows[0,2][1,1]", { rows: [[], []] }],
+  ["rows[0,2][invalid,1]", { rows: [[1], [3]] }],
+] as const)("retains parsed slice bounds for %s", async (filter, expected) => {
+  const output = await runFilteredCli(
+    {
+      rows: [
+        [1, 2],
+        [3, 4],
+      ],
+    },
+    "json",
+    filter,
+  );
+  expect(JSON.parse(output)).toEqual(expected);
+});
+
 it.each(["json", "jsonl", "yaml", "toon", "md"] as const)(
   "unions overlapping sibling slices independent of path order in %s",
   async (format) => {
@@ -375,7 +412,7 @@ it.each(["json", "jsonl", "yaml", "toon", "md"] as const)(
           .split("\n")
           .map((line) => JSON.parse(line)),
       ).toEqual([1, null, null]);
-    else if (format === "md") expect(output).toBe("[1,null,null]\n");
+    else if (format === "md") expect(output).toBe("\\[1,null,null\\]\n");
     else expect(output).toBe(`${Formatter.format(selected, format)}\n`);
     expect(value).toEqual([{ selected: 1 }, {}, { selected: null }]);
   },

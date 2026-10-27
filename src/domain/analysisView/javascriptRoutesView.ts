@@ -1,3 +1,4 @@
+import { analysisViewSourceSubject } from "./analysisViewParent.js";
 import { javascriptSourceRangeSchema } from "../javascript/javascriptSourceCoordinates.js";
 import { z } from "zod";
 import { webBundleViewRequestSchema } from "./webBundleView.js";
@@ -191,8 +192,6 @@ export const javaScriptRoutesViewSummarySchema = z.strictObject({
     unknown: z.int().nonnegative(),
   }),
 });
-export const javaScriptRoutesSourceReferenceSchema =
-  javaScriptRouteInventorySourceSchema;
 
 type Request = z.output<typeof javaScriptRoutesViewRequestSchema>;
 type Gap = z.infer<typeof javaScriptRouteGapSchema>;
@@ -346,10 +345,11 @@ export const projectJavaScriptRoutesView = (
       path: identity.data.input_path,
       sha256: identity.data.root_artifact_sha256,
     };
+    const sourceSubject = analysisViewSourceSubject(parent);
     if (
-      parent.subject != null &&
-      (parent.subject.local_path !== artifact.path ||
-        parent.subject.digest.sha256 !== artifact.sha256)
+      sourceSubject != null &&
+      (sourceSubject.local_path !== artifact.path ||
+        sourceSubject.digest.sha256 !== artifact.sha256)
     )
       return err(
         inputError(

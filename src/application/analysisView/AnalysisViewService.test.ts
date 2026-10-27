@@ -11,7 +11,7 @@ import {
   analysisViewJavaScriptEvidence,
   analysisViewLayoutEvidence,
 } from "../../../tests/fixtures/analysisView.js";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { JAVASCRIPT_APPLICATION_EVIDENCE_EXAMPLE } from "../../contracts/javascript/javascriptRuntimeReconciliationExample.js";
 import {
@@ -20,7 +20,7 @@ import {
   rebindEvidenceToTargetPath,
 } from "../../domain/evidence.js";
 import { inspectAnalysisViewInputSchema } from "../../domain/analysisView/analysisView.js";
-import { functionDossierSchema } from "../../domain/hopperValues.js";
+import { functionDossierSchema } from "../../domain/native/functionDossier.js";
 import { ghidraFunctionDossier } from "../../domain/ghidraValues.fixture.js";
 import {
   inspectAnalysisView,
@@ -33,6 +33,7 @@ import { EvidenceIntegrityError } from "../../domain/evidenceErrors.js";
 import { err, ok } from "../../domain/result.js";
 import { EvidenceLedger } from "../investigation/EvidenceLedger.js";
 import { WEB_NETWORK_CAPTURE_LIMITS } from "../../domain/webNetworkCapture.js";
+
 import { isImmutableJsonSnapshot } from "../../domain/immutableJson.js";
 import { createTestTempDirectory } from "../../../tests/fixtures/temporaryDirectory.js";
 import {
@@ -41,6 +42,123 @@ import {
   scenarioCaptureFixture,
 } from "../../../tests/fixtures/browserScenarioCapture.js";
 import { projectAnalysisError } from "../../domain/analysisErrorProjection.js";
+import * as evidenceFileSource from "./evidenceFileSource.js";
+
+it("projects retained GPU source facts while delivering the caller's rebound subject", () => {
+  const sha256 = "a".repeat(64);
+  const original = createEvidence(
+    { path: "/original/gpu", sha256, format: "elf" },
+    { id: "fixture", name: "Fixture", version: "1" },
+    {
+      operation: "inspect_gpu_code_objects",
+      parameters: {},
+      result: {
+        artifact: {
+          path: "/original/gpu",
+          file_size: 0,
+          sha256,
+          bytes_read: 0,
+        },
+        format: "elf",
+        analysis: "inventory",
+        objects: [],
+        kernels: [],
+        ptx_artifacts: [],
+        coverage: {
+          discovery_scope: "supported-section-names-and-standalone-formats",
+          discovery: "partial",
+          payloads: "not-requested",
+          examined_sections: 0,
+          unknown_section_names: 0,
+        },
+        limitations: [],
+      },
+    },
+  );
+  const ledger = new EvidenceLedger();
+  expect(ledger.record(original).ok).toBe(true);
+  const retained = ledger.forAnalysis(original.evidence_id)!;
+  const payload = retained.normalized_result;
+  const selected = rebindEvidenceToTargetPath(original, {
+    path: "/selected/gpu",
+    sha256,
+    format: "elf",
+  });
+  expect(selected.evidence_id).toBe(original.evidence_id);
+  const retention = {
+    recordEvidence: (evidence: Evidence) => ledger.record(evidence),
+    evidenceById: (id: string) => ledger.forAnalysis(id),
+  };
+  for (const view of [
+    { kind: "summary" as const },
+    {
+      kind: "gpu-code-objects" as const,
+      collection: "objects" as const,
+      offset: 0,
+      limit: 64,
+    },
+  ]) {
+    const result = projectRetainedAnalysis(selected, retention, view);
+    if (!result.ok) throw result.error;
+    expect(result.value.subject?.local_path).toBe("/selected/gpu");
+    expect(result.value.normalized_result).toMatchObject({
+      parent_evidence_id: original.evidence_id,
+      artifact: { path: "/original/gpu", sha256 },
+    });
+  }
+  expect(ledger.forAnalysis(original.evidence_id)).toBe(retained);
+  expect(retained.normalized_result).toBe(payload);
+  expect(retained.subject?.local_path).toBe("/original/gpu");
+  const mismatched = createEvidence(
+    { path: "/original/gpu", sha256: "b".repeat(64), format: "elf" },
+    original.provider,
+    {
+      operation: original.operation,
+      parameters: {},
+      result: original.normalized_result,
+    },
+  );
+  expect(summarizeRetainedAnalysis(mismatched, retention)).toMatchObject({
+    ok: false,
+    error: { _tag: "AnalysisInputError" },
+  });
+});
+it.each(["inline", "retained-evidence", "invalid"] as const)(
+  "refuses an already cancelled %s view before source admission",
+  async (kind) => {
+    const parent = analysisViewLayoutEvidence();
+    const ledger = new EvidenceLedger();
+    expect(ledger.record(parent).ok).toBe(true);
+    const retained = ledger.forAnalysis(parent.evidence_id);
+    let lookups = 0;
+    const controller = new AbortController();
+    const reason = Object.freeze({ requested: "cancel-before-view-admission" });
+    controller.abort(reason);
+    const result = await inspectAnalysisView(
+      kind === "invalid"
+        ? null
+        : {
+            source:
+              kind === "inline"
+                ? { kind, evidence: parent }
+                : { kind, evidence_id: parent.evidence_id },
+            view: { kind: "summary" },
+          },
+      (id) => {
+        lookups++;
+        return ledger.forAnalysis(id);
+      },
+      { signal: controller.signal },
+    );
+    expect(result).toMatchObject({
+      ok: false,
+      error: { _tag: "AnalysisCancelledError" },
+    });
+    expect(result.ok ? undefined : result.error.cause).toBe(reason);
+    expect(lookups).toBe(0);
+    expect(ledger.forAnalysis(parent.evidence_id)).toBe(retained);
+  },
+);
 
 it.each([false, true])(
   "summarizes the selected observation path rather than older retained display metadata (history=%s)",
@@ -1183,6 +1301,37 @@ describe("inspectAnalysisView", () => {
     });
     expect(result.ok ? undefined : result.error.cause).toBe(reason);
   });
+});
+
+it("prioritizes queued cancellation over a file authentication failure", async () => {
+  const controller = new AbortController();
+  const reason = Object.freeze({ requested: "cancel-after-authentication" });
+  // Model an event callback which queues the caller's cancellation notification
+  // as authentication finishes. The service must dispatch that notification
+  // before accepting the authentication failure.
+  const read = vi
+    .spyOn(evidenceFileSource, "readEvidenceFileSource")
+    .mockImplementationOnce(async () => {
+      setImmediate(() => setImmediate(() => controller.abort(reason)));
+      return err(new EvidenceIntegrityError("Invalid selected Evidence"));
+    });
+  try {
+    const result = await inspectAnalysisView(
+      {
+        source: { kind: "evidence-file", path: "/selected-evidence.json" },
+        view: manifestView,
+      },
+      undefined,
+      { signal: controller.signal },
+    );
+    expect(result).toMatchObject({
+      ok: false,
+      error: { _tag: "AnalysisCancelledError" },
+    });
+    expect(result.ok ? undefined : result.error.cause).toBe(reason);
+  } finally {
+    read.mockRestore();
+  }
 });
 
 describe("inspectAnalysisView scenario parents", () => {

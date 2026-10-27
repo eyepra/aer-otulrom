@@ -1,6 +1,5 @@
 import { parseAnalysisInput } from "../AnalysisInput.js";
 import { isNativeObservationOperation } from "../../domain/native/nativeObservation.js";
-import { setImmediate } from "node:timers/promises";
 import { dispatchQueuedInterrupts } from "../../process/queuedInterrupts.js";
 import { readImmutableEvidenceBundle } from "../EvidenceBundleFiles.js";
 import { INSPECT_ANALYSIS_VIEW_OPERATION } from "../../domain/analysisView/analysisViewErrors.js";
@@ -65,6 +64,7 @@ export const inspectAnalysisView = async (
     INSPECT_ANALYSIS_VIEW_OPERATION,
     rawInput,
     inspectAnalysisViewInputSchema,
+    options.signal,
   );
   if (!parsed.ok) return parsed;
   if (options.evidenceBundlePath !== undefined)
@@ -95,13 +95,11 @@ const inspectFileView = async (
     options,
     input.source.evidence_id,
   );
-  // Authentication and projection are synchronous; yield so a pending abort is dispatched before each check.
-  const cancelled = async (): Promise<boolean> => {
-    await setImmediate();
-    return options.signal?.aborted === true;
-  };
+  // Authentication and projection are synchronous; dispatch queued callbacks and
+  // the signal notifications they enqueue before accepting either result.
+  await dispatchQueuedInterrupts();
   // A request cancelled during authentication reports cancellation, even when authentication failed.
-  if (await cancelled())
+  if (options.signal?.aborted)
     return err(
       new AnalysisCancelledError(INSPECT_ANALYSIS_VIEW_OPERATION, {
         cause: options.signal?.reason,
@@ -113,8 +111,9 @@ const inspectFileView = async (
     { ...input, source: { kind: "retained-evidence", evidence_id: id } },
     (evidenceId) => (evidenceId === id ? loaded.value : lookup?.(evidenceId)),
   );
+  await dispatchQueuedInterrupts();
   // A request cancelled during projection delivers and records nothing.
-  if (await cancelled())
+  if (options.signal?.aborted)
     return err(
       new AnalysisCancelledError(INSPECT_ANALYSIS_VIEW_OPERATION, {
         cause: options.signal?.reason,
@@ -209,6 +208,7 @@ const projectResolvedAnalysisView = (
     // Sealing an Evidence root deep-freezes it; only the root is registered.
     sealedResult: isImmutableJsonSnapshot(parent),
     subject: presentation.subject,
+    sourceSubject: parent.subject,
     limitations: parent.limitations,
     parameters: parent.parameters,
     artifact:
@@ -400,6 +400,7 @@ const createAnalysisViewEvidence = (
           ? "inferred"
           : "derived",
       authority: parent.authority,
+      environment: parent.environment,
       limitations: result.limitations,
       ...((nativeFunctionView !== undefined || nativeObservationView) &&
       parent.relationship_coverage !== null
